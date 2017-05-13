@@ -3,39 +3,106 @@
 
 #include <iostream>
 #include <Windows.h>
+#include <memory>
 
-int main()
-{
+class SafeHandle {
+public:
+	SafeHandle(const SafeHandle&) = delete;
+	SafeHandle& operator=(const SafeHandle& other) = delete;
+	
+	SafeHandle(HANDLE handle) {
+		this->m_ManagedHandle = handle;
+	}
+	
+	SafeHandle(SafeHandle&& other) {
+		this->m_ManagedHandle = other.m_ManagedHandle;
+		other.m_ManagedHandle = INVALID_HANDLE_VALUE;
+	}
+	
+	SafeHandle& operator=(SafeHandle&& other) {
+		if(this != &other) {
+			this->m_ManagedHandle = other.m_ManagedHandle;
+			other.m_ManagedHandle = INVALID_HANDLE_VALUE;
+		}
+		
+		return *this;
+	}
+	
+	~SafeHandle() {
+		if(this->m_ManagedHandle != NULL && this->m_ManagedHandle != INVALID_HANDLE_VALUE)
+			CloseHandle(this->m_ManagedHandle);
+	}
+	
+public:
+	HANDLE get() const { return this->m_ManagedHandle; }
+	
+private:
+	HANDLE m_ManagedHandle;
+};
+
+class Allocator {
+public:
+	Allocator(void* memory, HANDLE proc = NULL) {
+		this->_memory = memory;
+		this->_optionalProcess = proc;
+	}
+	
+	~Allocator() {
+		if(this->_memory) {
+			if(this->_optionalProcess) {
+				VirtualFreeEx(this->_optionalProcess, this->_memory, 0, MEM_RELEASE);
+			} else {
+				VirtualFree(this->_memory, 0, MEM_RELEASE);
+			}
+		}
+	}
+	
+public:
+	void* get() const { return _memory; }
+	
+private:
+	HANDLE _optionalProcess
+	void* _memory;
+};
+
+int main() {
 	// path to our dll
 	LPCSTR DllPath = "D:\\projects\\standardinjection\\release\\testlib.dll";
 
 	// Open a handle to target process
-	HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, 17344);
+	SafeHandle hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, 17344);
+	
+	if(!hProcess)
+		return 0;
 
 	// Allocate memory for the dllpath in the target process
 	// length of the path string + null terminator
-	LPVOID pDllPath = VirtualAllocEx(hProcess, 0, strlen(DllPath) + 1,
-		MEM_COMMIT, PAGE_READWRITE);
+	Allocator mem(VirtualAllocEx(hProcess.get(), nullptr, strlen(DllPath) + 1,
+		MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), hProcess.get());
+	
+	if(!mem.get())
+		return 0;
 
 	// Write the path to the address of the memory we just allocated
 	// in the target process
-	WriteProcessMemory(hProcess, pDllPath, (LPVOID)DllPath,
-		strlen(DllPath) + 1, 0);
+	if(!WriteProcessMemory(hProcess.get(), mem.get(), DllPath,
+		strlen(DllPath) + 1, nullptr))
+		return 0;
 
 	// Create a Remote Thread in the target process which
 	// calls LoadLibraryA as our dllpath as an argument -> program loads our dll
-	HANDLE hLoadThread = CreateRemoteThread(hProcess, 0, 0,
-		(LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleA("Kernel32.dll"),
-			"LoadLibraryA"), pDllPath, 0, 0);
+	SafeHandle hLoadThread = CreateRemoteThread(hProcess.get(), nullptr, 0,
+		reinterpret_cast<LPTHREAD_START_ROUTINE>(GetProcAddress(GetModuleHandleA("Kernel32.dll"),
+			"LoadLibraryA")), mem.get(), 0, nullptr);
+	
+	if(!hLoadThread)
+		return 0;
 
 	// Wait for the execution of our loader thread to finish
 	WaitForSingleObject(hLoadThread, INFINITE);
 
 	std::cout << "Dll path allocated at: " << std::hex << pDllPath << std::endl;
 	std::cin.get();
-
-	// Free the memory allocated for our dll path
-	VirtualFreeEx(hProcess, pDllPath, strlen(DllPath) + 1, MEM_RELEASE);
 
 	return 0;
 }
